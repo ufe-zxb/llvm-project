@@ -1984,9 +1984,40 @@ wrapImplicitCandidateGroupForDevice(llvm::ArrayRef<fir::DoLoopOp> group) {
   mlir::OpBuilder hostBuilder(anchor);
   fir::FirOpBuilder builder(hostBuilder, fir::getKindMapping(module));
 
+  // Loop bounds must be host-evaluated so the SPMD loop_nest verifies. A bound
+  // also used in the body (e.g. by a nested fir.do_loop) additionally needs a
+  // mapped device copy, since host_eval args may only feed omp ops.
+  llvm::SmallDenseSet<mlir::Value> loopBounds;
+  llvm::SmallVector<mlir::Value> loopLB, loopUB, loopStep;
+  for (fir::DoLoopOp loop : group) {
+    loopLB.push_back(loop.getLowerBound());
+    loopUB.push_back(loop.getUpperBound());
+    loopStep.push_back(loop.getStep());
+    loopBounds.insert(loop.getLowerBound());
+    loopBounds.insert(loop.getUpperBound());
+    loopBounds.insert(loop.getStep());
+  }
+  auto boundNeedsDeviceCopy = [&](mlir::Value b) {
+    for (mlir::Operation *user : b.getUsers()) {
+      auto dl = mlir::dyn_cast<fir::DoLoopOp>(user);
+      if (!dl || !llvm::is_contained(group, dl))
+        return true;
+    }
+    return false;
+  };
+
+  llvm::SmallVector<mlir::Value> mappedLiveIns;
+  llvm::SmallVector<mlir::Value> hostEvalBounds;
   mlir::omp::TargetExtOperands targetOps;
   Fortran::utils::openmp::LiveInShapeInfoMap shapeMap;
   for (mlir::Value v : liveIns) {
+    if (loopBounds.contains(v)) {
+      targetOps.hostEvalVars.push_back(v);
+      hostEvalBounds.push_back(v);
+      if (!boundNeedsDeviceCopy(v))
+        continue;
+    }
+    mappedLiveIns.push_back(v);
     targetOps.mapVars.push_back(
         Fortran::utils::openmp::genMapInfoOpForLiveIn(builder, v));
     Fortran::utils::openmp::LiveInShapeInfo liveInShape(v);
@@ -2006,8 +2037,8 @@ wrapImplicitCandidateGroupForDevice(llvm::ArrayRef<fir::DoLoopOp> group) {
   // be a `fir.declare`. Emitting `hlfir.declare` here would leave HLFIR ops
   // that fail FIR-to-LLVM legalization.
   mlir::omp::TargetOp targetOp = Fortran::utils::openmp::genTargetOpFromLiveIns(
-      anchor.getLoc(), rewriter, mapper, liveIns, targetOps, emptyLoopNestOps,
-      shapeMap,
+      anchor.getLoc(), rewriter, mapper, mappedLiveIns, targetOps,
+      emptyLoopNestOps, shapeMap,
       [](fir::FirOpBuilder &builder, mlir::Location loc, mlir::Value liveInArg,
          llvm::StringRef name,
          mlir::Value shape) -> Fortran::utils::openmp::LiveInDeclareResult {
@@ -2024,12 +2055,36 @@ wrapImplicitCandidateGroupForDevice(llvm::ArrayRef<fir::DoLoopOp> group) {
         return {declareOp.getResult(), declareOp.getResult()};
       });
 
-  // Pre-clone metadata defs so next step has no dangling host refs
-  // (and cloneOrMapRegionOutsiders below doesn't spin on nested uses).
+  // SPMD verifier needs the target marked combined to reach the loop_nest.
+  targetOp.setCombined(true);
+
+  // Bounds reach the loop_nest via host_eval. Redirect any in-body uses to the
+  // mapped device value so host_eval args are consumed only by the loop_nest.
+  auto argIface = mlir::cast<mlir::omp::BlockArgOpenMPOpInterface>(*targetOp);
+  llvm::SmallDenseMap<mlir::Value, mlir::Value> hostEvalArgFor;
+  for (auto [bound, arg] :
+       llvm::zip_equal(hostEvalBounds, argIface.getHostEvalBlockArgs()))
+    hostEvalArgFor[bound] = arg;
+
+  auto loadedDeviceValue = [](mlir::Value mapArg) -> mlir::Value {
+    for (mlir::Operation *u : mapArg.getUsers())
+      if (auto decl = mlir::dyn_cast<fir::DeclareOp>(u))
+        for (mlir::Operation *du : decl.getResult().getUsers())
+          if (auto ld = mlir::dyn_cast<fir::LoadOp>(du))
+            return ld.getResult();
+    return {};
+  };
+  auto mapBlockArgs = argIface.getMapBlockArgs();
+  for (auto [idx, v] : llvm::enumerate(mappedLiveIns))
+    if (loopBounds.contains(v))
+      if (mlir::Value loaded = loadedDeviceValue(mapBlockArgs[idx]))
+        mapper.map(v, loaded);
+
+  // Pre-clone metadata defs so next step has no dangling host refs.
   preCloneMetadataIntoTarget(rewriter, targetOp, mapper, group);
 
   // Clone the span [front..back] into the target via `mapper`, then
-  // erase originals in reverse; cloneOrMapRegionOutsiders pulls in leftovers.
+  // erase originals in reverse. cloneOrMapRegionOutsiders pulls in leftovers.
   mlir::Operation *terminator = targetOp.getRegion().front().getTerminator();
   rewriter.setInsertionPoint(terminator);
 
@@ -2048,6 +2103,14 @@ wrapImplicitCandidateGroupForDevice(llvm::ArrayRef<fir::DoLoopOp> group) {
 
   Fortran::utils::openmp::cloneOrMapRegionOutsiders(builder, targetOp);
 
+  // Point each wrapped loop's bounds at the host_eval args so the lowered
+  // loop_nest is host-evaluated. Nested loops keep the mapped device values.
+  for (auto [idx, clonedLoop] : llvm::enumerate(clonedLoops)) {
+    clonedLoop.getLowerBoundMutable().assign(hostEvalArgFor.at(loopLB[idx]));
+    clonedLoop.getUpperBoundMutable().assign(hostEvalArgFor.at(loopUB[idx]));
+    clonedLoop.getStepMutable().assign(hostEvalArgFor.at(loopStep[idx]));
+  }
+
   // Wrap each cloned loop so the rest of this pass lowers them to
   // actual device parallel work.
   for (fir::DoLoopOp clonedLoop : clonedLoops)
@@ -2057,7 +2120,7 @@ wrapImplicitCandidateGroupForDevice(llvm::ArrayRef<fir::DoLoopOp> group) {
   targetOp->emitRemark()
       << "implicit-workdistribute(device): wrapped " << clonedLoops.size()
       << " array loop(s) in omp.target/omp.teams/omp.workdistribute with "
-      << liveIns.size() << " omp.map.info";
+      << targetOps.mapVars.size() << " omp.map.info";
 }
 
 /// Wrap every device candidate group in its own `omp.target`.

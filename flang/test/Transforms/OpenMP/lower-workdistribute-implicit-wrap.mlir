@@ -24,8 +24,14 @@
 // HOST:             } {omp.composite}
 // HOST:             omp.terminator
 // HOST:           }
-// DEVICE:         omp.map.info
-// DEVICE:         omp.target
+// The device kernel is SPMD and {omp.combined} (so the verifier can reach the
+// captured loop_nest). Its bounds are host-evaluated, so the loop_nest reads
+// the host_eval block args directly. Only `addr` is a mapped live-in here:
+// bounds that feed no in-body op are host_eval-only, no extra map.info.
+// DEVICE:         omp.target kernel_type(spmd)
+// DEVICE-SAME:      host_eval(%{{[^[:space:]]+}} -> %[[C_LB:[^ ,]+]], %{{[^[:space:]]+}} -> %[[C_UB:[^ ,]+]], %{{[^[:space:]]+}} -> %[[C_ST:[^ ,]+]] : index, index, index)
+// DEVICE:           omp.loop_nest (%{{.*}}) : index = (%[[C_LB]]) to (%[[C_UB]]) inclusive step (%[[C_ST]]) {
+// DEVICE:         } {omp.combined}
 // NOOP-NOT:       omp.teams
 // NOOP-NOT:       omp.workdistribute
 // NOOP:           fir.do_loop %{{[^ ]+}} = %{{[^ ]+}} to %{{[^ ]+}} step %{{[^ ]+}} unordered
@@ -101,7 +107,7 @@ func.func @parallel_skipped(%lb : index, %ub : index, %step : index,
   return
 }
 
-// Only the outermost unordered loop is wrapped (host/device); the inner
+// Only the outermost unordered loop is wrapped (host/device). The inner
 // unordered loop rides along unchanged inside the body. In none/default mode
 // both loops are left as bare `fir.do_loop`s.
 // BOTH-LABEL:   func.func @nested_only_outer(
@@ -111,8 +117,19 @@ func.func @parallel_skipped(%lb : index, %ub : index, %step : index,
 // HOST:                 omp.wsloop {
 // HOST:                   omp.loop_nest
 // HOST:                     fir.do_loop {{.*}} unordered
-// DEVICE:         omp.map.info
-// DEVICE:         omp.target
+// The inner loop reuses the outer bounds. host_eval args may only feed omp ops,
+// so the bounds are ALSO mapped and loaded on the device: the outer loop_nest
+// consumes the host_eval args, while the inner fir.do_loop consumes the loaded
+// device copies.
+// DEVICE:         omp.target kernel_type(spmd)
+// DEVICE-SAME:      host_eval(%{{[^[:space:]]+}} -> %[[N_LB:[^ ,]+]], %{{[^[:space:]]+}} -> %[[N_UB:[^ ,]+]], %{{[^[:space:]]+}} -> %[[N_ST:[^ ,]+]] : index, index, index)
+// DEVICE-SAME:      map_entries(
+// DEVICE:           %[[N_LB_LD:.*]] = fir.load %{{.*}} : !fir.ref<index>
+// DEVICE:           %[[N_UB_LD:.*]] = fir.load %{{.*}} : !fir.ref<index>
+// DEVICE:           %[[N_ST_LD:.*]] = fir.load %{{.*}} : !fir.ref<index>
+// DEVICE:           omp.loop_nest (%{{.*}}) : index = (%[[N_LB]]) to (%[[N_UB]]) inclusive step (%[[N_ST]]) {
+// DEVICE:             fir.do_loop %{{.*}} = %[[N_LB_LD]] to %[[N_UB_LD]] step %[[N_ST_LD]] unordered
+// DEVICE:         } {omp.combined}
 // NOOP-NOT:       omp.teams
 // NOOP-NOT:       omp.workdistribute
 // NOOP:           fir.do_loop {{.*}} unordered
